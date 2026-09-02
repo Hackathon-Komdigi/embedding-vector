@@ -40,8 +40,8 @@ COPY . .
 RUN mkdir -p uploads pipeline_output chunks extraction outputs/extracted outputs/chunks
 
 # Expose port untuk unified service
-EXPOSE 8002
+EXPOSE 8003
 
-# 2 worker karena tim 6 sudah memperbolehkan (tapi perhatikan konsumsi memori model ML)
+# 1 worker karena konsumsi memori model ML besar
 # Timeout 600s untuk pipeline yang prosesnya lama
-CMD ["gunicorn", "main:app", "-w", "1", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8002", "--timeout", "600"]
+CMD ["gunicorn", "main:app", "-w", "1", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8003", "--timeout", "600"]

@@ -7,12 +7,13 @@ import io
 import numpy as np
 import uvicorn
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-if "MODEL_API_URL" in os.environ:
-    del os.environ["MODEL_API_URL"]
+# Load environment variables from .env file
+load_dotenv()
 
 from model_registry import (
     get_dense_model,
