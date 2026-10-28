@@ -5,11 +5,12 @@ import os
 from typing import Dict, List, Optional
 
 import numpy as np
-import torch
-from dotenv import load_dotenv
 import requests
+import torch
 
-load_dotenv()
+from app_config import load_app_env
+
+load_app_env()
 
 
 DENSE_MODEL_NAME    = os.getenv("DENSE_MODEL", "")

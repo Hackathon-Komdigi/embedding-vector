@@ -1,1 +1,16 @@
 .env
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Runtime/editor artifacts
+logs/
+*.log
+*.pid
+.ipynb_checkpoints/

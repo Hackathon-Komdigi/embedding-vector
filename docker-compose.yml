@@ -10,10 +10,12 @@ services:
       --timeout 600
     ports:
       - "8003:8003"
-    volumes:
-      - ./.env:/app/.env
     env_file:
       - ./.env
+    environment:
+      TMPDIR: /tmp/embedding-vector
+    tmpfs:
+      - /tmp/embedding-vector:rw,nosuid,nodev,noexec,size=2g
     restart: unless-stopped
     deploy:
       resources:

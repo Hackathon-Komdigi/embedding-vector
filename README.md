@@ -1,55 +1,28 @@
-# 🚀 UB SR RAG Embedding Microservice (`ub-sr-rag-embedding`)
+# Embedding Vector Microservice
 
-**UB SR RAG Embedding Microservice** adalah layanan REST API berkinerja tinggi berbasis **FastAPI** dan **PyTorch** yang dirancang untuk mendukung ekosistem **Retrieval-Augmented Generation (RAG)**. Service ini menyediakan endpoint untuk **Dense Embeddings**, **Sparse Embeddings (SPLADE)**, **Reranking (Cross-Encoder)**, serta **Pengekstrak Dokumen & OCR (Docling)**.
+Service FastAPI untuk dense embedding, sparse embedding SPLADE, reranking, dan ekstraksi dokumen dengan Docling. Dalam mode bucket, hasil Markdown lengkap seluruh halaman diunggah ke S3-compatible storage/MinIO dan dikembalikan sebagai presigned `markdown_file`. Gambar `picture` dan `table` diunggah sebagai PNG binary dan dikembalikan melalui `image_url`; mode kompatibilitas tetap menggunakan `image_base64`.
 
----
+## Endpoint
 
-## 📑 Daftar Isi
-1. [Fitur Utama](#-fitur-utama)
-2. [Struktur Proyek](#-struktur-proyek)
-3. [Prasyarat & Variabel Lingkungan (.env)](#-prasyarat--variabel-lingkungan-env)
-4. [Cara Menjalankan: Tanpa Docker (Non-Docker)](#-cara-menjalankan-tanpa-docker-non-docker)
-   - [Persiapan Dependensi Sistem & Virtual Environment](#1-persiapan-dependensi-sistem--virtual-environment)
-   - [Instalasi PyTorch (CPU vs GPU)](#2-instalasi-pytorch-cpu-vs-gpu)
-   - [Menjalankan Server Foreground (Interaktif)](#3-menjalankan-server-foreground-interaktif)
-   - [Menjalankan Background dengan `nohup`](#4-menjalankan-background-menggunakan-nohup)
-   - [Menjalankan Background dengan `setsid`](#5-menjalankan-background-menggunakan-setsid)
-5. [Cara Menjalankan: Menggunakan Docker](#-cara-menjalankan-menggunakan-docker)
-   - [Menggunakan Docker Compose (Direkomendasikan)](#1-menggunakan-docker-compose-direkomendasikan)
-   - [Menggunakan Docker CLI Langsung](#2-menggunakan-docker-cli-langsung)
-6. [Dokumentasi API Endpoints](#-dokumentasi-api-endpoints)
-7. [Troubleshooting & Tips Performa](#-troubleshooting--tips-performa)
+| Endpoint | Method | Fungsi |
+|---|---|---|
+| `/embed/dense` | POST | Dense vector embedding |
+| `/embed/sparse/query` | POST | Sparse query vector SPLADE |
+| `/embed/sparse/passages` | POST | Sparse passage vectors |
+| `/rerank` | POST | Cross-encoder reranking |
+| `/extract/docling` | POST | Ekstraksi struktur, teks, OCR, tabel, gambar, dan Markdown dari format dokumen yang didukung Docling |
 
----
+Swagger UI tersedia di `http://localhost:8003/docs`.
 
-## ✨ Fitur Utama
+## Konfigurasi
 
-- **Dense Vector Embedding**: Memproses teks menjadi dense vector menggunakan library `SentenceTransformers` (misal: model `BAAI/bge-m3`).
-- **Sparse Vector Embedding (SPLADE)**: Menghasilkan sparse vectors (kombinasi `indices` dan `values`) menggunakan arsitektur SPLADE (`AutoModelForMaskedLM` & `AutoTokenizer`).
-- **Rerank Scoring**: Menghitung skor relevansi pasangan query-dokumen menggunakan `CrossEncoder`.
-- **Document Parser & OCR (Docling)**: Mengekstrak teks, struktur header, daftar, rumus matematika, dan gambar (format Base64) dari file PDF secara otomatis.
-- **Auto Model Preloading**: Mengunduh dan memuat seluruh model ke memori GPU/RAM pada saat server startup guna menghindari latency pada request pertama.
-- **Proxy Mode Support**: Opsi untuk meneruskan request ke server model terpisah via HTTP (`MODEL_API_URL`).
+Salin contoh konfigurasi tanpa menimpa `.env` yang sudah ada:
 
----
-
-## 📁 Struktur Proyek
-
-```text
-ub-sr-rag-embedding/
-├── main.py              # Entrypoint server FastAPI & pemroses HTTP REST endpoints
-├── model_registry.py    # Singleton registry untuk Dense, Sparse, Reranker, & Docling
-├── requirements.txt     # Dependensi Python
-├── Dockerfile           # Konfigurasi Docker image dengan Tesseract OCR & OpenCV libs
-├── docker-compose.yml   # Konfigurasi containerization service
-└── README.md            # Dokumentasi lengkap proyek
+```bash
+cp -n .env.example .env
 ```
 
----
-
-## ⚙️ Prasyarat & Variabel Lingkungan (`.env`)
-
-Buat file `.env` pada direktori akar proyek. Anda dapat mengonfigurasi model Hugging Face yang ingin digunakan:
+Isi nilai berikut:
 
 ```env
 # Konfigurasi Model Hugging Face
@@ -57,324 +30,246 @@ DENSE_MODEL=BAAI/bge-m3
 SPARSE_MODEL=naver/splade-cocondenser-ensembledistil
 RERANKER_MODEL=BAAI/bge-reranker-large
 
-# (Opsional) Mode Proxy: Hanya diisi jika service ini berlaku sebagai proxy ke server embedding terpisah
-# MODEL_API_URL=http://127.0.0.1:8003
+# Konfigurasi Vision / Image
+USE_VISION_BUCKET=true
+BUCKET_ACCESS_KEY=replace-with-access-key
+BUCKET_SECRET_KEY=replace-with-secret-key
+BUCKET_URL=http://minio.example:9000
+BUCKET_NAME=regulatory-documents
+
+# Opsional; default 3600, rentang valid 1-604800 detik
+BUCKET_PRESIGNED_URL_EXPIRES=3600
 ```
 
-### 💡 Cara Load File `.env` Saat Menjalankan Tanpa Docker (Non-Docker)
+Aplikasi memuat `.env` dari direktori modul aplikasi, bukan dari current working directory. Environment proses dari systemd, Docker, atau shell tidak ditimpa oleh `.env` (`override=False`), sehingga environment proses memiliki prioritas lebih tinggi.
 
-Terdapat 3 cara bagaimana file `.env` dimuat saat Anda menjalankan aplikasi secara Non-Docker:
+### Aturan `USE_VISION_BUCKET`
 
-1. **Otomatis via Library `python-dotenv` (Direkomendasikan & Default)**
-   - Di dalam file `main.py` dan `model_registry.py`, telah ditambahkan fungsi `load_dotenv()`.
-   - Saat Anda menjalankan `python main.py` atau via `gunicorn`/`uvicorn`, aplikasi akan **otomatis membaca file `.env`** yang berada di direktori akar proyek secara langsung tanpa perlu perintah tambahan.
+- Tidak ditetapkan: default `true`.
+- Nilai true: `true`, `1`, `yes`, `on`.
+- Nilai false: `false`, `0`, `no`, `off`.
+- Kapitalisasi dan spasi awal/akhir diabaikan.
+- Nilai kosong atau selain daftar tersebut ditolak sebagai kesalahan konfigurasi HTTP 503.
+- Ketika `true`, `BUCKET_ACCESS_KEY`, `BUCKET_SECRET_KEY`, `BUCKET_URL`, dan `BUCKET_NAME` wajib diisi. `BUCKET_NAME` harus memenuhi format nama bucket S3 (3-63 karakter lowercase, angka, titik, atau tanda hubung; bukan alamat IP).
+- Gunakan `USE_VISION_BUCKET=false` untuk kembali ke respons Base64. Dalam mode ini client S3 tidak dibuat dan bucket tidak dihubungi.
 
-2. **Eksplisit via Flag `--env-file` (Jika Menggunakan Uvicorn CLI)**
-   - Anda dapat membacakan file `.env` secara langsung lewat opsi terminal CLI uvicorn:
-     ```bash
-     uvicorn main:app --env-file .env --host 0.0.0.0 --port 8003
-     ```
+Konfigurasi dan client storage baru divalidasi/dibuat saat endpoint Docling memerlukannya. Masalah storage tidak menggagalkan startup maupun endpoint dense, sparse, dan reranker. Jika mode bucket aktif, kegagalan storage tidak diubah menjadi Base64.
 
-3. **Eksplisit via Linux Shell (`export` / `env`)**
-   - Jika ingin me-load seluruh baris `.env` ke environment variabel Linux sebelum menjalankan gunicorn / nohup / setsid:
-     ```bash
-     # Load .env ke sesi terminal Linux
-     export $(grep -v '^#' .env | xargs)
+## MinIO/S3
 
-     # Lalu jalankan dengan nohup / setsid
-     nohup gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8003 --timeout 600 > app.log 2>&1 &
-     ```
+`BUCKET_URL` dipakai apa adanya sebagai endpoint S3 API, termasuk hostname, skema, dan port. Aplikasi tidak mengganti port secara otomatis. Port default MinIO biasanya:
 
----
+- `9000`: S3 API.
+- `9001`: Console web.
 
-## 💻 Cara Menjalankan: Tanpa Docker (Non-Docker)
+Pemetaan deployment dapat berbeda, jadi port `9001` tetap sah apabila memang dipetakan ke S3 API. Jika endpoint mengembalikan redirect, HTML Console, atau pesan bahwa request harus memakai API port, endpoint merespons HTTP 502 dengan petunjuk agar `BUCKET_URL` diarahkan ke S3 API. Redirect ke Console tidak dianggap sebagai upload berhasil.
 
-### 1. Persiapan Dependensi Sistem & Virtual Environment
+Client menggunakan Signature Version 4, region `us-east-1`, path-style addressing, verifikasi TLS normal untuk HTTPS, timeout terbatas, dan retry terbatas. Jangan masukkan kredensial ke Dockerfile atau source code.
 
-Di sistem operasi Linux (Ubuntu/Debian), beberapa library sistem diperlukan untuk pengolahan gambar (OpenCV/Docling) dan OCR (Tesseract):
+Sebelum upload pertama, service memeriksa bucket. Bucket yang benar-benar tidak ada dibuat otomatis. Race ketika proses lain membuat bucket ditangani dan upload `NoSuchBucket` dicoba ulang secara terbatas setelah ensure/create. Access denied, kredensial/signature salah, endpoint salah, connection refused, dan timeout tidak dianggap sebagai bucket hilang. Service tidak mengubah policy/ACL dan tidak membuat bucket public.
 
-```bash
-# Update repository dan install dependensi sistem
-sudo apt update && sudo apt install -y \
-    build-essential \
-    git \
-    tesseract-ocr \
-    libgl1 \
-    libglib2.0-0 \
-    libxcb1 \
-    libx11-xcb1 \
-    libxrender1 \
-    libxext6 \
-    libxfixes3 \
-    libxkbcommon0 \
-    libxdamage1 \
-    libxrandr2 \
-    libxi6
+Kredensial minimal harus memiliki izin yang sesuai untuk:
 
-# Buat dan aktifkan virtual environment Python
-python3 -m venv venv
-source venv/bin/activate
-```
+- memeriksa/list bucket (`HeadBucket`/izin ekuivalen);
+- membuat bucket bila belum ada;
+- `PutObject` untuk upload PNG dan Markdown;
+- `GetObject` untuk akses melalui presigned URL.
 
----
+Jika bucket disiapkan sebelumnya, izin membuat bucket dapat dihilangkan selama `HeadBucket`, `PutObject`, dan signing/`GetObject` tetap diizinkan.
 
-### 2. Instalasi PyTorch (CPU vs GPU)
+Server Linux harus dapat menjangkau `BUCKET_URL` untuk pemeriksaan dan upload. Hostname/port yang tertulis di presigned URL juga harus dapat dijangkau oleh konsumen `image_url`. Signing yang sukses tidak membuktikan konektivitas konsumen.
 
-Pilihlah salah satu sesuai dengan ketersediaan perangkat keras di server lokal Anda:
+## Kontrak `/extract/docling`
 
-#### 🟢 Opsi A: CPU Only
-```bash
-pip install --upgrade pip
-pip install -r requirements.txt
-```
+Elemen teks, section header, list item, formula, urutan, nomor halaman, dan `total_pages` tetap sama. Gambar tanpa data dilewati; gambar dengan lebar atau tinggi kurang dari 80 piksel tetap difilter.
 
-#### 🚀 Opsi B: Dengan GPU (NVIDIA CUDA Support)
-Jika server Anda memiliki GPU NVIDIA dan NVIDIA CUDA Driver sudah terinstall:
+### Mode bucket (default)
 
-```bash
-pip install --upgrade pip
+Gambar diserialisasi ke PNG lossless dalam buffer memori lalu diunggah sebagai binary dengan `Content-Type: image/png`. Jalur ini tidak membuat Base64 atau data URI. Object key unik berbentuk `docling/{request_uuid}/page-{page_no}/{element_type}-{image_index}.png`.
 
-# Install PyTorch versi CUDA (contoh: CUDA 12.1 atau CUDA 11.8)
-pip install torch --index-url https://download.pytorch.org/whl/cu121
+Docling mengekspor seluruh isi dokumen—semua halaman dalam urutan dokumen—menjadi satu string Markdown melalui `export_to_markdown()`. Markdown UTF-8 tersebut diunggah sebagai `text/markdown; charset=utf-8` ke `docling/{request_uuid}/document.md`. Root response `markdown_file` berisi presigned GET URL untuk object ini. Suffix aman dari nama upload diteruskan ke file sementara sehingga endpoint dapat menerima format input lain yang didukung instalasi Docling, tanpa menggunakan nama file klien sebagai path server.
 
-# Install sisa dependensi proyek tanpa menimpa versi torch CUDA
-pip install fastapi uvicorn gunicorn pydantic python-dotenv requests sentence-transformers rank_bm25 huggingface_hub langgraph langchain_core langchain_aws langchain_openai langchain_community boto3 jinja2 docling pypdf python-multipart Pillow qdrant-client transformers numpy cachetools
-```
-
----
-
-### 3. Menjalankan Server Foreground (Interaktif)
-
-Untuk keperluan uji coba/testing, Anda dapat menjalankan server secara langsung di terminal:
-
-- **Menggunakan Uvicorn (Development Mode)**:
-  ```bash
-  uvicorn main:app --host 0.0.0.0 --port 8003 --reload
-  ```
-- **Menggunakan Gunicorn (Production Mode)**:
-  ```bash
-  gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8003 --timeout 600
-  ```
-- **Langsung via Python Script**:
-  ```bash
-  python main.py
-  ```
-
----
-
-### 4. Menjalankan Background menggunakan `nohup`
-
-`nohup` (No Hang Up) memungkinkan proses tetap berjalan di background meskipun sesi SSH atau terminal ditutup.
-
-#### 🚀 Menjalankan Service:
-```bash
-nohup gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8003 --timeout 600 > app.log 2>&1 &
-```
-
-#### 📊 Memantau & Mengelola Proses:
-- **Melihat Log secara Real-time**:
-  ```bash
-  tail -f app.log
-  ```
-- **Cek Process ID (PID)**:
-  ```bash
-  ps aux | grep main:app
-  ```
-- **Menghentikan Service**:
-  ```bash
-  pkill -f "gunicorn main:app"
-  # Atau matikan spesifik PID:
-  kill <PID>
-  ```
-
----
-
-### 5. Menjalankan Background menggunakan `setsid`
-
-`setsid` membuat sesi/process group baru sehingga proses terlepas penuh dari terminal pembuka (detaching).
-
-#### 🚀 Menjalankan Service:
-```bash
-setsid gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8003 --timeout 600 > app.log 2>&1 &
-```
-
-#### 📊 Memantau & Mengelola Proses:
-- **Melihat Log**:
-  ```bash
-  tail -f app.log
-  ```
-- **Mengecek Status Port / Service**:
-  ```bash
-  ss -tulpn | grep 8003
-  ```
-- **Menghentikan Service**:
-  ```bash
-  pkill -f "gunicorn main:app"
-  ```
-
----
-
-## 🐳 Cara Menjalankan: Menggunakan Docker
-
-### 1. Menggunakan Docker Compose (Direkomendasikan)
-
-#### 🟢 Opsi CPU Only:
-Secara default, file `docker-compose.yml` dikonfigurasi untuk CPU:
-
-```bash
-# Build dan jalankan di background
-docker-compose up -d --build
-
-# Cek log aplikasi
-docker-compose logs -f model_api
-```
-
-#### 🚀 Opsi GPU Supported:
-Jika ingin menggunakan GPU NVIDIA di Docker, pastikan `nvidia-container-toolkit` telah terpasang di host server, lalu tambahkan blok `reservations` pada `docker-compose.yml`:
-
-```yaml
-services:
-  model_api:
-    build: .
-    container_name: model_api
-    command: >
-      gunicorn main:app
-      -w 1
-      -k uvicorn.workers.UvicornWorker
-      --bind 0.0.0.0:8003
-      --timeout 600
-    ports:
-      - "8003:8003"
-    volumes:
-      - ./.env:/app/.env
-    env_file:
-      - ./.env
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 8G
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-```
-Jalankan dengan:
-```bash
-docker-compose up -d --build
-```
-
----
-
-### 2. Menggunakan Docker CLI Langsung
-
-#### 🟢 Build Docker Image:
-```bash
-docker build -t ub-sr-rag-embedding .
-```
-
-#### 🟢 Jalankan Container (CPU Only):
-```bash
-docker run -d \
-  --name model_api \
-  --env-file .env \
-  -p 8003:8003 \
-  ub-sr-rag-embedding
-```
-
-#### 🚀 Jalankan Container (GPU Enabled):
-```bash
-docker run -d \
-  --name model_api \
-  --gpus all \
-  --env-file .env \
-  -p 8003:8003 \
-  ub-sr-rag-embedding
-```
-
----
-
-## 📡 Dokumentasi API Endpoints
-
-Setelah server berjalan, Anda dapat mengakses dokumentasi **Interactive Swagger UI** di browser:
-👉 **`http://localhost:8003/docs`**
-
-### Ringkasan Endpoints:
-
-| Endpoint | Method | Deskripsi | Example Payload |
-|---|---|---|---|
-| `/embed/dense` | `POST` | Menghasilkan Dense Vector Embeddings | `{"texts": ["Halo dunia"], "normalize_embeddings": true}` |
-| `/embed/sparse/query` | `POST` | Menghasilkan Sparse Query Vector (SPLADE) | `{"text": "kata kunci pencarian"}` |
-| `/embed/sparse/passages` | `POST` | Menghasilkan Sparse Passage Vectors Batch | `{"texts": ["Paragraf 1", "Paragraf 2"]}` |
-| `/rerank` | `POST` | Menghitung skor relevansi query & passages | `{"query": "Siapa CEO Google?", "texts": ["Sundar Pichai", "Kucing hitam"]}` |
-| `/extract/docling` | `POST` | Parser Dokumen PDF + OCR gambar & tabel | `multipart/form-data` dengan parameter `file` |
-
----
-
-### 📝 Contoh Request & Response
-
-#### 1. Dense Embedding (`POST /embed/dense`)
-```bash
-curl -X POST "http://localhost:8003/embed/dense" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "texts": ["Kecerdasan Buatan dalam RAG"],
-       "normalize_embeddings": true
-     }'
-```
-**Response Sample:**
 ```json
 {
-  "vectors": [
-    [0.0123, -0.0456, 0.0789, ...]
+  "total_pages": 11,
+  "markdown_file": "http://storage.example/regulatory-documents/docling/.../document.md?...",
+  "elements": [
+    {
+      "type": "section_header",
+      "page": 1,
+      "text": "Pendahuluan"
+    },
+    {
+      "type": "text",
+      "page": 1,
+      "text": "Contoh isi dokumen."
+    },
+    {
+      "type": "table",
+      "page": 4,
+      "image_url": "http://storage.example/regulatory-documents/docling/...?..."
+    }
   ]
 }
 ```
 
-#### 2. Sparse Query Vector (`POST /embed/sparse/query`)
-```bash
-curl -X POST "http://localhost:8003/embed/sparse/query" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "text": "dokumen RAG"
-     }'
-```
-**Response Sample:**
+`image_base64` tidak disertakan dalam mode bucket, termasuk sebagai `null`. `image_url` dan `markdown_file` ditandatangani untuk operasi `get_object`, berlaku sesuai `BUCKET_PRESIGNED_URL_EXPIRES`, dan bukan tautan permanen. Service ini tidak menyediakan proxy atau refresh URL.
+
+### Mode Base64
+
+Atur `USE_VISION_BUCKET=false`. Mode ini tidak menghubungi object storage, sehingga `markdown_file` bernilai `null`; elemen gambar tetap memakai Base64:
+
 ```json
 {
-  "indices": [101, 2054, 4832],
-  "values": [0.421, 1.892, 0.954]
+  "total_pages": 11,
+  "markdown_file": null,
+  "elements": [
+    {
+      "type": "table",
+      "page": 4,
+      "image_base64": "iVBORw0KGgoAAA..."
+    }
+  ]
 }
 ```
 
-#### 3. Reranker (`POST /rerank`)
+Jika satu upload atau signing gagal, request tidak mengembalikan sukses parsial dan elemen gambar tidak dihilangkan diam-diam. Status storage:
+
+- `503`: konfigurasi bucket tidak lengkap/tidak valid;
+- `502`: kegagalan upstream storage selain timeout;
+- `504`: timeout storage setelah retry terbatas.
+
+## Upload PDF dengan curl
+
+Jangan menambahkan header `Content-Type: application/json`. Opsi `--form` membuat multipart boundary yang benar.
+
+Klien Linux:
+
 ```bash
-curl -X POST "http://localhost:8003/rerank" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "query": "Apa itu RAG?",
-       "texts": [
-         "RAG adalah Retrieval-Augmented Generation.",
-         "Resep membuat nasi goreng jawa."
-       ]
-     }'
-```
-**Response Sample:**
-```json
-{
-  "scores": [8.4215, -4.1203]
-}
+curl --location 'https://embedding.aideaspark.com/extract/docling' \
+  --form 'file=@"/home/anjas/Downloads/674-Article Text-2557-1-10-20230220.pdf"'
 ```
 
----
+Klien Windows:
 
-## 💡 Troubleshooting & Tips Performa
+```bash
+curl --location 'https://embedding.aideaspark.com/extract/docling' \
+  --form 'file=@"C:/Users/anjas/Downloads/674-Article Text-2557-1-10-20230220.pdf"'
+```
 
-1. **Konsumsi Memori GPU/RAM (Out of Memory / OOM)**:
-   - Penggunaan worker Gunicorn diset ke `-w 1` secara default karena model ML (Dense + SPLADE + Reranker + Docling) memuat checkpoint berukuran gigabyte ke memori. Menambah jumlah worker akan menduplikasi pemuatan model di setiap worker.
-2. **Timeout pada Pengolahan Dokumen PDF (Docling)**:
-   - Parameter `--timeout 600` di Gunicorn disiapkan untuk pemrosesan file PDF berhalaman banyak yang membutuhkan OCR tingkat tinggi.
-3. **Deteksi Perangkat Keras (CUDA vs CPU)**:
-   - Script `model_registry.py` secara otomatis mendeteksi ketersediaan CUDA (`torch.cuda.is_available()`). Jika CUDA terdeteksi, model otomatis dijalankan di GPU (`cuda`).
+Path file mengikuti komputer yang menjalankan curl. Server Linux menerima isi file melalui multipart `UploadFile`; server tidak mencoba membuka path Linux atau Windows milik klien.
 
+## Menjalankan tanpa Docker
+
+Ubuntu/Debian memerlukan library OCR/gambar yang sama dengan Dockerfile, antara lain Tesseract dan library OpenCV:
+
+```bash
+sudo apt update
+sudo apt install -y build-essential git tesseract-ocr libgl1 libglib2.0-0 \
+  libxcb1 libx11-xcb1 libxrender1 libxext6 libxfixes3 libxkbcommon0 \
+  libxdamage1 libxrandr2 libxi6
+
+python3 -m venv .venv
+. .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+Development:
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8003
+```
+
+Production foreground (satu worker karena model menggunakan RAM/VRAM besar):
+
+```bash
+/path/absolut/embedding-vector/.venv/bin/gunicorn main:app \
+  --workers 1 \
+  --worker-class uvicorn.workers.UvicornWorker \
+  --bind 0.0.0.0:8003 \
+  --timeout 600
+```
+
+Docling, serialisasi gambar, dan boto3 bersifat blocking dan dijalankan melalui threadpool endpoint. File upload disalin ke direktori sementara sistem menggunakan `tempfile`, file ditutup sebelum Docling membukanya, lalu selalu dihapus pada jalur sukses maupun gagal. Hanya suffix aman dari nama file klien yang dipertahankan agar Docling dapat mengenali format; nama file klien tidak digunakan sebagai path server. `TMPDIR` dihormati. Direktori tersebut harus tersedia, cukup ruang, dan writable oleh user service.
+
+## systemd
+
+Contoh `/etc/systemd/system/embedding-vector.service` (ganti seluruh placeholder dan gunakan path absolut):
+
+```ini
+[Unit]
+Description=Embedding Vector API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<service-user>
+Group=<service-group>
+WorkingDirectory=/opt/embedding-vector
+EnvironmentFile=/etc/embedding-vector/embedding-vector.env
+RuntimeDirectory=embedding-vector
+RuntimeDirectoryMode=0750
+Environment=TMPDIR=/run/embedding-vector
+ExecStart=/opt/embedding-vector/.venv/bin/gunicorn main:app --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8003 --timeout 600
+Restart=on-failure
+RestartSec=5
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`RuntimeDirectory=embedding-vector` membuat `/run/embedding-vector` dan memberi kepemilikan kepada user service, sehingga `TMPDIR` tetap writable walaupun `PrivateTmp=true`. File environment harus hanya dapat dibaca oleh administrator dan user service karena berisi secret. Contoh pemasangan unit (tidak dijalankan otomatis oleh repository ini):
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now embedding-vector.service
+sudo systemctl status embedding-vector.service
+journalctl -u embedding-vector.service -f
+```
+
+## Docker
+
+Buat `.env` dari `.env.example`, isi kredensial, lalu:
+
+```bash
+docker compose up -d --build
+docker compose logs -f model_api
+```
+
+`docker-compose.yml` meneruskan seluruh `.env` sebagai environment container dan menyediakan tmpfs writable melalui `TMPDIR=/tmp/embedding-vector`. Kredensial tidak disalin ke Dockerfile/image. Untuk Docker CLI:
+
+```bash
+docker build -t embedding-vector .
+docker run -d --name model_api --env-file .env -p 8003:8003 \
+  --tmpfs /tmp/embedding-vector:rw,nosuid,nodev,noexec,size=2g \
+  -e TMPDIR=/tmp/embedding-vector embedding-vector
+```
+
+## Pengujian
+
+Suite menggunakan mock Docling dan mock client S3. Pengujian tidak memerlukan GPU, checkpoint model, atau koneksi ke bucket:
+
+```bash
+python -m unittest discover -v
+```
+
+Pengujian integrasi storage harus dilakukan terpisah di environment staging, bukan terhadap bucket pengguna saat development:
+
+1. Isi `BUCKET_*` dengan kredensial staging dan endpoint S3 API yang dapat dijangkau.
+2. Jalankan service dengan `USE_VISION_BUCKET=true`.
+3. Upload dokumen yang didukung Docling dan berisi gambar memakai curl.
+4. Pastikan root `markdown_file` dapat di-GET sebelum expiry, berisi Markdown UTF-8 lengkap, dan object bertipe `text/markdown; charset=utf-8`.
+5. Pastikan elemen gambar memiliki `image_url`, tidak memiliki `image_base64`, URL dapat di-GET sebelum expiry, object bertipe `image/png`, dan bucket dibuat hanya bila belum ada.
+6. Jalankan ulang dengan `USE_VISION_BUCKET=false`; pastikan `markdown_file` bernilai `null`, elemen gambar memiliki `image_base64`, dan tidak ada request ke storage.
+
+## Keamanan deployment
+
+Endpoint API tidak menambahkan skema autentikasi aplikasi baru atau kuota bucket. Pada deployment yang dapat diakses jaringan publik, tempatkan service di belakang reverse proxy/API gateway yang menerapkan autentikasi, batas ukuran multipart, rate limit, timeout, dan batas concurrency. Terapkan quota/lifecycle bucket di MinIO/S3 sesuai kebijakan operasional agar klien tidak dapat menghabiskan disk sementara, CPU OCR, atau kapasitas bucket. Batas tersebut sengaja dikelola pada lapisan deployment dan storage, bukan dengan hardcode di service.
+
+## Batasan dan performa
+
+Mode bucket mengurangi ukuran JSON dan transfer respons API, terutama untuk gambar beresolusi tinggi. Perubahan ini tidak menghilangkan waktu konversi/OCR Docling, serialisasi PNG, upload storage, atau download gambar oleh konsumen. Presigned URL kedaluwarsa; konsumen harus mengambil gambar sebelum expiry. Tidak ada endpoint refresh URL. Upload yang sudah berhasil sebelum kegagalan elemen berikutnya dapat tetap menjadi object privat yang tidak direferensikan oleh respons gagal.

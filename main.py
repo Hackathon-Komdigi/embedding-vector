@@ -1,34 +1,47 @@
-import os
 import base64
-import tempfile
-from pathlib import Path
-from typing import List, Dict, Any, Optional
 import io
+import shutil
+import tempfile
+import threading
+import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 import numpy as np
 import uvicorn
-
-from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
-# Load environment variables from .env file
-load_dotenv()
+from app_config import load_app_env
+
+load_app_env()
 
 from model_registry import (
     get_dense_model,
-    get_sparse_model,
-    get_reranker,
     get_docling_converter,
-    preload_all
+    get_reranker,
+    get_sparse_model,
+    preload_all,
+)
+from vision_storage import (
+    StorageConfigurationError,
+    StorageTimeoutError,
+    StorageUpstreamError,
+    get_vision_storage,
+    vision_bucket_enabled,
 )
 
-app = FastAPI(title="Model API Microservice")
-
-@app.on_event("startup")
-def startup_event():
-    # Preload all models on startup
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
     preload_all()
+    yield
+
+
+app = FastAPI(title="Model API Microservice", lifespan=lifespan)
+_docling_conversion_lock = threading.Lock()
+
 
 class DenseRequest(BaseModel):
     texts: List[str]
@@ -93,71 +106,136 @@ def rerank(req: RerankRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/extract/docling")
-async def extract_docling(file: UploadFile = File(...)):
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(await file.read())
-            tmp_path = tmp.name
+def process_docling_upload(
+    upload_stream, converter, storage=None, suffix: str = ".pdf"
+) -> Dict[str, Any]:
+    """Convert one uploaded document and optionally store its outputs in S3."""
+    safe_suffix = suffix.lower()
+    if (
+        not safe_suffix.startswith(".")
+        or len(safe_suffix) > 11
+        or not safe_suffix[1:].isalnum()
+    ):
+        safe_suffix = ".bin"
 
-        converter = get_docling_converter()
-        result = converter.convert(tmp_path)
-        
+    temp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=safe_suffix) as temp_file:
+            temp_path = Path(temp_file.name)
+            upload_stream.seek(0)
+            shutil.copyfileobj(upload_stream, temp_file)
+
+        with _docling_conversion_lock:
+            result = converter.convert(str(temp_path))
         total_pages = len(result.document.pages) if hasattr(result.document, "pages") else 0
-        
+
         elements = []
-        img_counter = 0
+        image_counter = 0
         current_page = 0
-        
+        request_id = str(uuid.uuid4())
+        markdown_file = None
+        if storage is not None:
+            markdown_text = result.document.export_to_markdown()
+            markdown_file = storage.upload_markdown(
+                markdown_text,
+                f"docling/{request_id}/document.md",
+            )
+
         for element, _ in result.document.iterate_items():
             page_no = element.prov[0].page_no if element.prov else current_page
             current_page = page_no
-            
+
             if element.label == "section_header":
-                elements.append({
-                    "type": "section_header",
-                    "page": page_no,
-                    "text": element.text,
-                })
+                elements.append(
+                    {
+                        "type": "section_header",
+                        "page": page_no,
+                        "text": element.text,
+                    }
+                )
             elif element.label in ("text", "list_item"):
                 text = element.text.strip()
                 if text:
-                    elements.append({
-                        "type": element.label,
-                        "page": page_no,
-                        "text": text,
-                    })
+                    elements.append(
+                        {
+                            "type": element.label,
+                            "page": page_no,
+                            "text": text,
+                        }
+                    )
             elif element.label == "formula":
-                elements.append({
-                    "type": "formula",
-                    "page": page_no,
-                    "text": element.text,
-                })
-            elif element.label in ("picture", "table"):
-                if hasattr(element, "image") and element.image is not None:
-                    pil_img = element.image.pil_image
-                    if pil_img.width < 80 or pil_img.height < 80:
-                        continue
-                    img_counter += 1
-                    
-                    buf = io.BytesIO()
-                    pil_img.save(buf, format="PNG")
-                    b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
-                    
-                    elements.append({
-                        "type": element.label,
+                elements.append(
+                    {
+                        "type": "formula",
                         "page": page_no,
-                        "image_base64": b64_str,
-                    })
+                        "text": element.text,
+                    }
+                )
+            elif element.label in ("picture", "table"):
+                if not hasattr(element, "image") or element.image is None:
+                    continue
+                pil_image = element.image.pil_image
+                if pil_image is None:
+                    continue
+                if pil_image.width < 80 or pil_image.height < 80:
+                    continue
 
-        os.remove(tmp_path)
-        
+                image_counter += 1
+                with io.BytesIO() as image_buffer:
+                    pil_image.save(image_buffer, format="PNG")
+                    png_bytes = image_buffer.getvalue()
+
+                image_element = {
+                    "type": element.label,
+                    "page": page_no,
+                }
+                if storage is None:
+                    image_element["image_base64"] = base64.b64encode(png_bytes).decode(
+                        "utf-8"
+                    )
+                else:
+                    object_key = (
+                        f"docling/{request_id}/page-{page_no}/"
+                        f"{element.label}-{image_counter}.png"
+                    )
+                    image_element["image_url"] = storage.upload_png(
+                        png_bytes, object_key
+                    )
+                elements.append(image_element)
+
         return {
             "total_pages": total_pages,
-            "elements": elements
+            "markdown_file": markdown_file,
+            "elements": elements,
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def extract_docling_sync(upload_stream, filename: Optional[str] = None) -> Dict[str, Any]:
+    """Run all blocking Docling/image/storage work outside the event loop."""
+    use_bucket = vision_bucket_enabled()
+    storage = get_vision_storage() if use_bucket else None
+    converter = get_docling_converter()
+    suffix = Path(filename or "").suffix or ".bin"
+    return process_docling_upload(upload_stream, converter, storage, suffix=suffix)
+
+
+@app.post("/extract/docling")
+async def extract_docling(file: UploadFile = File(...)):
+    try:
+        return await run_in_threadpool(extract_docling_sync, file.file, file.filename)
+    except HTTPException:
+        raise
+    except StorageConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except StorageTimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except StorageUpstreamError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8003, workers=1)
