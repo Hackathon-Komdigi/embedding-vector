@@ -232,6 +232,12 @@ class VisionStorageTests(unittest.TestCase):
             ExpiresIn=1234,
         )
 
+    def test_bucket_path_combines_configured_bucket_and_object_key(self):
+        self.assertEqual(
+            self.storage.bucket_path("docling/request/document.md"),
+            "documents/docling/request/document.md",
+        )
+
     def test_markdown_is_uploaded_as_utf8_and_presigned(self):
         key = "docling/request/document.md"
 

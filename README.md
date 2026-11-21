@@ -1,6 +1,6 @@
 # Embedding Vector Microservice
 
-Service FastAPI untuk dense embedding, sparse embedding SPLADE, reranking, dan ekstraksi dokumen dengan Docling. Dalam mode bucket, hasil Markdown lengkap seluruh halaman diunggah ke S3-compatible storage/MinIO dan dikembalikan sebagai presigned `markdown_file`. Gambar `picture` dan `table` diunggah sebagai PNG binary dan dikembalikan melalui `image_url`; mode kompatibilitas tetap menggunakan `image_base64`.
+Service FastAPI untuk dense embedding, sparse embedding SPLADE, reranking, dan ekstraksi dokumen dengan Docling. Dalam mode bucket, hasil Markdown lengkap seluruh halaman diunggah ke S3-compatible storage/MinIO dan dikembalikan sebagai presigned `markdown_file`. Response `elements` berisi chunk teks semantik berformat Markdown dan gambar `picture`; tabel disertakan sebagai teks Markdown, bukan gambar.
 
 ## Endpoint
 
@@ -81,31 +81,35 @@ Server Linux harus dapat menjangkau `BUCKET_URL` untuk pemeriksaan dan upload. H
 
 ## Kontrak `/extract/docling`
 
-Elemen teks, section header, list item, formula, urutan, nomor halaman, dan `total_pages` tetap sama. Gambar tanpa data dilewati; gambar dengan lebar atau tinggi kurang dari 80 piksel tetap difilter.
+Response `elements` hanya memiliki dua nilai `type`: `text` dan `image`. Setelah satu Markdown penuh diekspor, struktur `DoclingDocument` yang sama diproses dengan `HybridChunker`, yang menggunakan `HierarchicalChunker` dan pemisahan semantik Docling. Body chunk memakai anggaran 432 token dan overlap hingga 64 token antarchunk dalam bab/subbab yang sama; overlap diperkecil bila komposisi mendekati target 512 token. Heading dimasukkan sebagai heading Markdown ke setiap chunk terkait; chunk mengikuti batas struktur seperti bab, subbab, paragraf, list, formula, atau tabel, sedangkan konten yang terlalu panjang dipecah pada batas semantik. List, numbering, formula, dan tabel menjadi bagian dari chunk `text`. Tabel diserialisasi sebagai pipe table Markdown dan tidak diunggah sebagai gambar. Overlap tidak melintasi gambar atau tabel. HTML di dalam chunk di-escape dan hyperlink tidak dipertahankan agar consumer tidak menerima markup aktif tanpa sengaja.
+
+Gambar `picture` tetap berada dalam urutan dokumen sebagai `type: image`. Gambar tanpa data dilewati; gambar dengan lebar atau tinggi kurang dari 80 piksel tetap difilter.
 
 ### Mode bucket (default)
 
-Gambar diserialisasi ke PNG lossless dalam buffer memori lalu diunggah sebagai binary dengan `Content-Type: image/png`. Jalur ini tidak membuat Base64 atau data URI. Object key unik berbentuk `docling/{request_uuid}/page-{page_no}/{element_type}-{image_index}.png`.
+Gambar `picture` diserialisasi ke PNG lossless dalam buffer memori lalu diunggah sebagai binary dengan `Content-Type: image/png`. Jalur ini tidak membuat Base64 atau data URI. Object key unik berbentuk `docling/{request_uuid}/page-{page_no}/picture-{image_index}.png`.
 
-Docling mengekspor seluruh isi dokumen—semua halaman dalam urutan dokumen—menjadi satu string Markdown melalui `export_to_markdown()`. Markdown UTF-8 tersebut diunggah sebagai `text/markdown; charset=utf-8` ke `docling/{request_uuid}/document.md`. Root response `markdown_file` berisi presigned GET URL untuk object ini. Suffix aman dari nama upload diteruskan ke file sementara sehingga endpoint dapat menerima format input lain yang didukung instalasi Docling, tanpa menggunakan nama file klien sebagai path server.
+Docling mengekspor seluruh isi dokumen—semua halaman dalam urutan dokumen—menjadi satu string Markdown melalui `export_to_markdown()`. Markdown UTF-8 tersebut diunggah sebagai `text/markdown; charset=utf-8` ke `docling/{request_uuid}/document.md`. Root response `markdown_file` berisi presigned GET URL, `bucket_path` berisi `{bucket_name}/docling/{request_uuid}/document.md` tanpa query signing, dan `file_name` bernilai `document.md`. Suffix aman dari nama upload diteruskan ke file sementara sehingga endpoint dapat menerima format input lain yang didukung instalasi Docling, tanpa menggunakan nama file klien sebagai path server.
 
 ```json
 {
   "total_pages": 11,
   "markdown_file": "http://storage.example/regulatory-documents/docling/.../document.md?...",
+  "bucket_path": "regulatory-documents/docling/.../document.md",
+  "file_name": "document.md",
   "elements": [
-    {
-      "type": "section_header",
-      "page": 1,
-      "text": "Pendahuluan"
-    },
     {
       "type": "text",
       "page": 1,
-      "text": "Contoh isi dokumen."
+      "text": "# Pendahuluan\n\nContoh isi dokumen."
     },
     {
-      "type": "table",
+      "type": "text",
+      "page": 4,
+      "text": "## Hasil\n\n| Nama | Nilai |\n| --- | ---: |\n| Ani | 90 |"
+    },
+    {
+      "type": "image",
       "page": 4,
       "image_url": "http://storage.example/regulatory-documents/docling/...?..."
     }
@@ -123,9 +127,11 @@ Atur `USE_VISION_BUCKET=false`. Mode ini tidak menghubungi object storage, sehin
 {
   "total_pages": 11,
   "markdown_file": null,
+  "bucket_path": null,
+  "file_name": "document.md",
   "elements": [
     {
-      "type": "table",
+      "type": "image",
       "page": 4,
       "image_base64": "iVBORw0KGgoAAA..."
     }

@@ -223,6 +223,9 @@ class VisionStorage:
         except (ClientError, ResponseParserError, BotoCoreError) as exc:
             raise _translate_storage_error(exc) from exc
 
+    def bucket_path(self, object_key: str) -> str:
+        return f"{self.config.bucket_name}/{object_key}"
+
     def upload_png(self, png_bytes: bytes, object_key: str) -> str:
         return self._upload_bytes(png_bytes, object_key, "image/png")
 

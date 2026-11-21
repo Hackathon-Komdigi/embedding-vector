@@ -92,6 +92,9 @@ class FakeStorage:
         self.markdown_calls = []
         self.error = error
 
+    def bucket_path(self, object_key):
+        return f"documents/{object_key}"
+
     def upload_png(self, png_bytes, object_key):
         if self.error:
             raise self.error
@@ -109,6 +112,13 @@ class DoclingProcessingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.main = load_main_with_fake_registry()
+
+    def setUp(self):
+        self.chunk_patch = patch.object(self.main, "build_text_chunks", return_value=[])
+        self.chunk_patch.start()
+
+    def tearDown(self):
+        self.chunk_patch.stop()
 
     def test_bucket_mode_uploads_binary_png_without_base64(self):
         converter = FakeConverter(
@@ -153,12 +163,14 @@ class DoclingProcessingTests(unittest.TestCase):
             response["markdown_file"],
             f"http://signed.example/{markdown_key}?signature=redacted",
         )
+        self.assertEqual(response["bucket_path"], f"documents/{markdown_key}")
+        self.assertEqual(response["file_name"], "document.md")
         self.assertEqual(converter.converted_path.suffix, ".docx")
         self.assertFalse(converter.converted_path.exists())
 
     def test_base64_mode_does_not_require_storage(self):
         converter = FakeConverter(
-            [element("table", page=4, image=Image.new("RGB", (80, 80), "blue"))]
+            [element("picture", page=4, image=Image.new("RGB", (80, 80), "blue"))]
         )
 
         response = self.main.process_docling_upload(
@@ -167,38 +179,63 @@ class DoclingProcessingTests(unittest.TestCase):
 
         image_element = response["elements"][0]
         self.assertIsNone(response["markdown_file"])
+        self.assertIsNone(response["bucket_path"])
+        self.assertEqual(response["file_name"], "document.md")
         self.assertIn("image_base64", image_element)
         self.assertNotIn("image_url", image_element)
         self.assertTrue(base64.b64decode(image_element["image_base64"]).startswith(b"\x89PNG"))
 
-    def test_text_order_types_pages_and_small_image_filter_are_preserved(self):
+    def test_text_chunks_and_images_keep_document_order_and_small_images_are_filtered(self):
         elements = [
             element("section_header", page=1, text="Pendahuluan"),
-            element("text", page=1, text="  Isi dokumen.  "),
-            element("list_item", page=2, text=" Butir "),
-            element("formula", page=2, text="x=1"),
+            element("text", page=1, text="Isi dokumen."),
+            element("table", page=2, image=Image.new("RGB", (100, 100))),
             element("picture", page=2, image=Image.new("RGB", (79, 100))),
-            element("table", page=2, image=Image.new("RGB", (100, 79))),
-            element("picture", page=2, image=None),
-            SimpleNamespace(
-                label="picture",
-                text="",
-                prov=[SimpleNamespace(page_no=2)],
-                image=SimpleNamespace(pil_image=None),
-            ),
-            element("table", page=2, image=Image.new("RGB", (80, 80))),
+            element("picture", page=3, image=Image.new("RGB", (80, 80))),
+        ]
+        for index, item in enumerate(elements):
+            item.self_ref = f"#/items/{index}"
+        chunks = [
+            {"type": "text", "page": 1, "text": "# Pendahuluan\n\nIsi dokumen.", "_sequence": 0},
+            {"type": "text", "page": 2, "text": "| A | B |\n| - | - |\n| 1 | 2 |", "_sequence": 2},
         ]
 
-        response = self.main.process_docling_upload(
-            io.BytesIO(b"pdf"), FakeConverter(elements), FakeStorage()
-        )
+        with patch.object(self.main, "build_text_chunks", return_value=chunks):
+            response = self.main.process_docling_upload(
+                io.BytesIO(b"pdf"), FakeConverter(elements), FakeStorage(), chunk_tokenizer=Mock()
+            )
 
-        self.assertEqual(
-            [item["type"] for item in response["elements"]],
-            ["section_header", "text", "list_item", "formula", "table"],
-        )
-        self.assertEqual([item["page"] for item in response["elements"]], [1, 1, 2, 2, 2])
-        self.assertEqual(response["elements"][1]["text"], "Isi dokumen.")
+        self.assertEqual([item["type"] for item in response["elements"]], ["text", "text", "image"])
+        self.assertEqual([item["page"] for item in response["elements"]], [1, 2, 3])
+        self.assertIn("| A | B |", response["elements"][1]["text"])
+
+    def test_elements_only_contain_semantic_text_chunks_and_picture_images(self):
+        elements = [
+            element("section_header", page=1, text="Pendahuluan"),
+            element("text", page=1, text="Isi dokumen."),
+            element("list_item", page=1, text="Butir"),
+            element("table", page=2, image=Image.new("RGB", (100, 100))),
+            element("picture", page=3, image=Image.new("RGB", (100, 100))),
+        ]
+        for index, item in enumerate(elements):
+            item.self_ref = f"#/items/{index}"
+        storage = FakeStorage()
+        chunks = [
+            {"type": "text", "page": 1, "text": "# Pendahuluan\n\nIsi dokumen.\n\n- Butir", "_sequence": 0},
+            {"type": "text", "page": 2, "text": "| Nama | Nilai |\n| --- | --- |\n| Ani | 90 |", "_sequence": 3},
+        ]
+
+        with patch.object(self.main, "build_text_chunks", return_value=chunks):
+            response = self.main.process_docling_upload(
+                io.BytesIO(b"pdf"), FakeConverter(elements), storage, chunk_tokenizer=Mock()
+            )
+
+        self.assertEqual([item["type"] for item in response["elements"]], ["text", "text", "image"])
+        self.assertTrue(all("_sequence" not in item for item in response["elements"]))
+        self.assertIn("| Nama | Nilai |", response["elements"][1]["text"])
+        self.assertEqual(len(storage.calls), 1)
+        self.assertIn("/picture-1.png", storage.calls[0][1])
+        self.assertIn("image_url", response["elements"][2])
 
     def test_object_keys_are_unique_between_requests(self):
         picture = element("picture", image=Image.new("RGB", (80, 80)))
@@ -262,6 +299,18 @@ class DoclingEndpointTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.main = load_main_with_fake_registry()
+
+    def setUp(self):
+        self.chunk_patch = patch.object(self.main, "build_text_chunks", return_value=[])
+        self.tokenizer_patch = patch.object(
+            self.main, "_create_chunk_tokenizer", return_value=Mock()
+        )
+        self.chunk_patch.start()
+        self.tokenizer_patch.start()
+
+    def tearDown(self):
+        self.tokenizer_patch.stop()
+        self.chunk_patch.stop()
 
     def _upload_file(self):
         return SimpleNamespace(file=io.BytesIO(b"document"), filename="sample.docx")
@@ -329,7 +378,13 @@ class DoclingEndpointTests(unittest.TestCase):
 
         self.assertEqual(
             response,
-            {"total_pages": 2, "markdown_file": None, "elements": []},
+            {
+                "total_pages": 2,
+                "markdown_file": None,
+                "bucket_path": None,
+                "file_name": "document.md",
+                "elements": [],
+            },
         )
 
     def test_incomplete_bucket_config_is_detected_before_docling_conversion(self):

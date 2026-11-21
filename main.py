@@ -1,4 +1,5 @@
 import base64
+import copy
 import io
 import shutil
 import tempfile
@@ -10,11 +11,13 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import uvicorn
+from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 from app_config import load_app_env
+from document_chunking import build_text_chunks
 
 load_app_env()
 
@@ -41,6 +44,9 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="Model API Microservice", lifespan=lifespan)
 _docling_conversion_lock = threading.Lock()
+_docling_chunking_lock = threading.Lock()
+_chunk_tokenizer_lock = threading.Lock()
+_chunk_tokenizer = None
 
 
 class DenseRequest(BaseModel):
@@ -107,9 +113,13 @@ def rerank(req: RerankRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 def process_docling_upload(
-    upload_stream, converter, storage=None, suffix: str = ".pdf"
+    upload_stream,
+    converter,
+    storage=None,
+    suffix: str = ".pdf",
+    chunk_tokenizer=None,
 ) -> Dict[str, Any]:
-    """Convert one uploaded document and optionally store its outputs in S3."""
+    """Convert one uploaded document, chunk it, and optionally store outputs."""
     safe_suffix = suffix.lower()
     if (
         not safe_suffix.startswith(".")
@@ -127,90 +137,102 @@ def process_docling_upload(
 
         with _docling_conversion_lock:
             result = converter.convert(str(temp_path))
-        total_pages = len(result.document.pages) if hasattr(result.document, "pages") else 0
-
-        elements = []
-        image_counter = 0
-        current_page = 0
+        document = result.document
+        total_pages = len(document.pages) if hasattr(document, "pages") else 0
         request_id = str(uuid.uuid4())
+
+        # Export the complete document first. Chunking then uses the same merged,
+        # structured DoclingDocument so hierarchy, paragraphs, lists and tables survive.
+        markdown_text = document.export_to_markdown()
+        markdown_file_name = "document.md"
+        markdown_object_key = f"docling/{request_id}/{markdown_file_name}"
         markdown_file = None
+        bucket_path = None
         if storage is not None:
-            markdown_text = result.document.export_to_markdown()
             markdown_file = storage.upload_markdown(
                 markdown_text,
-                f"docling/{request_id}/document.md",
+                markdown_object_key,
             )
+            bucket_path = storage.bucket_path(markdown_object_key)
 
-        for element, _ in result.document.iterate_items():
+        with _docling_chunking_lock:
+            ordered_elements = build_text_chunks(document, chunk_tokenizer)
+        item_order = {
+            item.self_ref: index
+            for index, (item, _) in enumerate(document.iterate_items())
+            if getattr(item, "self_ref", None)
+        }
+        image_counter = 0
+        current_page = 0
+        for fallback_sequence, (element, _) in enumerate(document.iterate_items()):
             page_no = element.prov[0].page_no if element.prov else current_page
             current_page = page_no
+            if element.label != "picture":
+                continue
+            if not hasattr(element, "image") or element.image is None:
+                continue
+            pil_image = element.image.pil_image
+            if pil_image is None:
+                continue
+            if pil_image.width < 80 or pil_image.height < 80:
+                continue
 
-            if element.label == "section_header":
-                elements.append(
-                    {
-                        "type": "section_header",
-                        "page": page_no,
-                        "text": element.text,
-                    }
+            image_counter += 1
+            with io.BytesIO() as image_buffer:
+                pil_image.save(image_buffer, format="PNG")
+                png_bytes = image_buffer.getvalue()
+
+            image_element = {
+                "type": "image",
+                "page": page_no,
+                "_sequence": item_order.get(
+                    getattr(element, "self_ref", ""), fallback_sequence
+                ),
+            }
+            if storage is None:
+                image_element["image_base64"] = base64.b64encode(png_bytes).decode(
+                    "utf-8"
                 )
-            elif element.label in ("text", "list_item"):
-                text = element.text.strip()
-                if text:
-                    elements.append(
-                        {
-                            "type": element.label,
-                            "page": page_no,
-                            "text": text,
-                        }
-                    )
-            elif element.label == "formula":
-                elements.append(
-                    {
-                        "type": "formula",
-                        "page": page_no,
-                        "text": element.text,
-                    }
+            else:
+                object_key = (
+                    f"docling/{request_id}/page-{page_no}/"
+                    f"picture-{image_counter}.png"
                 )
-            elif element.label in ("picture", "table"):
-                if not hasattr(element, "image") or element.image is None:
-                    continue
-                pil_image = element.image.pil_image
-                if pil_image is None:
-                    continue
-                if pil_image.width < 80 or pil_image.height < 80:
-                    continue
+                image_element["image_url"] = storage.upload_png(
+                    png_bytes, object_key
+                )
+            ordered_elements.append(image_element)
 
-                image_counter += 1
-                with io.BytesIO() as image_buffer:
-                    pil_image.save(image_buffer, format="PNG")
-                    png_bytes = image_buffer.getvalue()
-
-                image_element = {
-                    "type": element.label,
-                    "page": page_no,
-                }
-                if storage is None:
-                    image_element["image_base64"] = base64.b64encode(png_bytes).decode(
-                        "utf-8"
-                    )
-                else:
-                    object_key = (
-                        f"docling/{request_id}/page-{page_no}/"
-                        f"{element.label}-{image_counter}.png"
-                    )
-                    image_element["image_url"] = storage.upload_png(
-                        png_bytes, object_key
-                    )
-                elements.append(image_element)
+        ordered_elements.sort(key=lambda item: item.get("_sequence", 0))
+        for item in ordered_elements:
+            item.pop("_sequence", None)
 
         return {
             "total_pages": total_pages,
             "markdown_file": markdown_file,
-            "elements": elements,
+            "bucket_path": bucket_path,
+            "file_name": markdown_file_name,
+            "elements": ordered_elements,
         }
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
+
+
+def _create_chunk_tokenizer():
+    global _chunk_tokenizer
+    if _chunk_tokenizer is None:
+        with _chunk_tokenizer_lock:
+            if _chunk_tokenizer is None:
+                dense_model = get_dense_model()
+                independent_tokenizer = copy.deepcopy(
+                    getattr(dense_model, "tokenizer")
+                )
+                _chunk_tokenizer = HuggingFaceTokenizer(
+                    tokenizer=independent_tokenizer,
+                    max_tokens=512,
+                )
+    return _chunk_tokenizer
 
 
 def extract_docling_sync(upload_stream, filename: Optional[str] = None) -> Dict[str, Any]:
@@ -218,8 +240,15 @@ def extract_docling_sync(upload_stream, filename: Optional[str] = None) -> Dict[
     use_bucket = vision_bucket_enabled()
     storage = get_vision_storage() if use_bucket else None
     converter = get_docling_converter()
+    chunk_tokenizer = _create_chunk_tokenizer()
     suffix = Path(filename or "").suffix or ".bin"
-    return process_docling_upload(upload_stream, converter, storage, suffix=suffix)
+    return process_docling_upload(
+        upload_stream,
+        converter,
+        storage,
+        suffix=suffix,
+        chunk_tokenizer=chunk_tokenizer,
+    )
 
 
 @app.post("/extract/docling")
